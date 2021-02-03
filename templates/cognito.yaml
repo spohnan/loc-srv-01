@@ -1,0 +1,64 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: 'Location Service Cognito Stack'
+
+Parameters:
+
+  MapArn:
+    Type: String
+    Description: Arn of a Map resource
+    AllowedPattern: '^arn:aws(.+)?:geo:.+'
+
+Resources:
+
+  IdentityPool:
+    Type: 'AWS::Cognito::IdentityPool'
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W57
+            reason: |
+              unauthenticated access is intentially allowed using
+              a restrictive role to get map tiles
+    Properties:
+      AllowUnauthenticatedIdentities: true
+
+  IdentityPoolRoleMapping:
+    Type: "AWS::Cognito::IdentityPoolRoleAttachment"
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        unauthenticated: !GetAtt CognitoUnAuthenticatedRole.Arn
+
+  CognitoUnAuthenticatedRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Federated: 'cognito-identity.amazonaws.com'
+            Action:
+              - 'sts:AssumeRoleWithWebIdentity'
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref IdentityPool
+              'ForAnyValue:StringLike':
+                'cognito-identity.amazonaws.com:amr': unauthenticated
+      Policies:
+        - PolicyName: 'CognitoUnauthorizedPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'geo:GetMap*'
+                Resource: !Ref MapArn
+
+Outputs:
+
+  IdentityPoolId:
+    Description: ID of the Cognito IdentityPool
+    Value: !Ref IdentityPool
