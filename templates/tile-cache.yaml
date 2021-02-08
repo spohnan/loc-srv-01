@@ -13,13 +13,10 @@ Metadata:
           - IncludeLambdaEdge
           - CloudFrontTTL
           - PriceClass
-          - HTTPSMinimumProtocolVersion
           - LogRetentionPeriod
     ParameterLabels:
       CloudFrontTTL:
         default: 'Cache TTL'
-      HTTPSMinimumProtocolVersion:
-        default: 'Minimum HTTPS Protocol'
       IncludeLambdaEdge:
         default: 'Toggle Lambda Function'
       LogRetentionPeriod:
@@ -35,12 +32,6 @@ Parameters:
     Type: Number
     MinValue: 0
     Default: 300
-
-  HTTPSMinimumProtocolVersion:
-    Description: 'Minimum HTTPS protocol version used by CloudFront'
-    Type: String
-    AllowedValues: ['TLSv1', 'TLSv1_2016', 'TLSv1.1_2016', 'TLSv1.2_2018']
-    Default: 'TLSv1.2_2018'
 
   IncludeLambdaEdge:
     Description: 'Cache filling function'
@@ -83,6 +74,13 @@ Resources:
           - id: W41
             reason: Content is just a cache of public map tiles
     Properties:
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods:
+              - GET
+              - HEAD
+            AllowedOrigins:
+              - '*'
       LoggingConfiguration:
         DestinationBucketName: !Ref LoggingBucket
         LogFilePrefix: 'TileCacheBucket/'
@@ -135,6 +133,28 @@ Resources:
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
 
+  TileCachePolicy:
+    Type: 'AWS::CloudFront::CachePolicy'
+    Properties:
+      CachePolicyConfig:
+        DefaultTTL: !Ref CloudFrontTTL
+        MaxTTL: 86400
+        MinTTL: !Ref CloudFrontTTL
+        Name: !Sub 'CachePolicy-${AWS::StackName}'
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig:
+            CookieBehavior: none
+          EnableAcceptEncodingBrotli: true
+          EnableAcceptEncodingGzip: true
+          HeadersConfig:
+            HeaderBehavior: whitelist
+            Headers:
+              - 'Access-Control-Request-Headers'
+              - 'Access-Control-Request-Method'
+              - 'Origin'
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
   TileCacheCDN:
     Type: 'AWS::CloudFront::Distribution'
     Metadata:
@@ -142,43 +162,45 @@ Resources:
         rules_to_suppress:
           # Cloudfront should use minimum protocol version TLS 1.2
           - id: W70
-            reason: Default parameter value is TLSv1.2_2018
+            reason: Using TLSv1.2_2018
     Properties:
       DistributionConfig:
+        CacheBehaviors:
+          - AllowedMethods:
+              - GET
+              - HEAD
+            CachePolicyId: !GetAtt TileCachePolicy.Id
+            Compress: true
+            LambdaFunctionAssociations:
+              - !If
+                - IncludeLambdaEdge
+                - EventType: 'origin-request'
+                  LambdaFunctionARN: !Ref RequestHandlerFunctionVersion
+                - !Ref 'AWS::NoValue'
+            PathPattern: '*'
+            TargetOriginId: S3TileCache
+            ViewerProtocolPolicy: redirect-to-https
+        DefaultCacheBehavior:
+          ForwardedValues:
+            QueryString: false
+          TargetOriginId: S3TileCache
+          ViewerProtocolPolicy: redirect-to-https
+        Enabled: true
+        HttpVersion: http2
+        Logging:
+          Bucket: !GetAtt LoggingBucket.DomainName
+          Prefix: 'TileCacheCDN/'
         Origins:
           - DomainName: !GetAtt TileCacheBucket.DomainName
-            Id: S3Origin
+            Id: S3TileCache
             S3OriginConfig:
               OriginAccessIdentity: !Sub
                 - 'origin-access-identity/cloudfront/${CloudFrontUser}'
                 - {CloudFrontUser: !Ref CloudFrontUser}
-        Enabled: true
-        HttpVersion: 'http2'
-        DefaultCacheBehavior:
-          AllowedMethods:
-            - GET
-            - HEAD
-          Compress: true
-          TargetOriginId: S3Origin
-          DefaultTTL: !Ref CloudFrontTTL
-          ForwardedValues:
-            QueryString: false
-            Cookies:
-              Forward: none
-          ViewerProtocolPolicy: redirect-to-https
-          LambdaFunctionAssociations:
-            - !If
-              - IncludeLambdaEdge
-              - EventType: 'origin-request'
-                LambdaFunctionARN: !Ref RequestHandlerFunctionVersion
-              - !Ref 'AWS::NoValue'
         PriceClass: !Ref PriceClass
         ViewerCertificate:
           CloudFrontDefaultCertificate: true
-          MinimumProtocolVersion: !Ref HTTPSMinimumProtocolVersion
-        Logging:
-          Bucket: !GetAtt LoggingBucket.DomainName
-          Prefix: 'TileCacheCDN/'
+          MinimumProtocolVersion: TLSv1.2_2018
 
   CloudFrontUser:
     Type: 'AWS::CloudFront::CloudFrontOriginAccessIdentity'
@@ -196,10 +218,12 @@ Resources:
       Timeout: 5
       Code:
         ZipFile: |
-          # Start upgrade workaround ... remove when boto3 v1.17 is available 
+          # Start upgrade workaround ... remove when boto3 v1.17 is available
           import sys
           from pip._internal import main
-          main(['install', '-I', '-q', 'boto3', '--target', '/tmp/', '--no-cache-dir', '--disable-pip-version-check'])
+          main(['install', '-I', '-q', 'boto3',
+                '--target', '/tmp/', '--no-cache-dir',
+                '--disable-pip-version-check'])
           sys.path.insert(0,'/tmp/')
           # End workarond
 
@@ -211,18 +235,22 @@ Resources:
           geo = boto3.client('location')
           s3 = boto3.client('s3')
 
+          def get_content_type(obj):
+            ct = obj['ContentType']
+            if ct and ct.strip():
+              return ct
+            return 'application/octet-stream'
+
           def handler(event, context):
               request = event['Records'][0]['cf']['request']
 
-              #print("boto3 version:"+boto3.__version__)
-              
               # Remove the forward / from the uri
               key = request['uri'][1:]
               uri = key.split('/')
               request_type = uri[4]
-              
+
               if request_type == 'tiles':
-                  
+
                   objFetch = geo.get_map_tile(
                       MapName=uri[3],
                       Z=uri[5],
@@ -230,26 +258,25 @@ Resources:
                       Y=uri[7])
 
               elif request_type == 'sprites':
-                  
+
                   objFetch = geo.get_map_sprites(
                       FileName=uri[5],
                       MapName=uri[3])
 
               elif request_type == 'style-descriptor':
-                  
+
                   objFetch = geo.get_map_style_descriptor(MapName=uri[3])
 
-
               elif request_type == 'glyphs':
-                  
+
                   objFetch = geo.get_map_glyphs(
                       FontStack=unquote(uri[5]),
                       FontUnicodeRange=uri[6],
                       MapName=uri[3])
 
               body_content = objFetch['Blob'].read()
-              content_type = objFetch['ContentType']
-              
+              content_type = get_content_type(objFetch)
+
               s3.put_object(Bucket='tile-cache-tilecachebucket-1jn1tscxg4uvw',
                         Key=key,
                         Body=body_content,
@@ -258,14 +285,12 @@ Resources:
               body_content_b64 = base64.b64encode(body_content).decode('utf-8')
 
               return {
-                  'statusCode': 200,
-                  'headers': {
-                      'content-type': json.dumps(content_type),
-                      'content-length': len(body_content_b64),
-                      'access-control-allow-origin': '*'
+                  "statusCode": 200,
+                  "headers": {
+                      "Content-Type": json.dumps(content_type),
                   },
-                  'body': json.dumps(body_content_b64),
-                  'isBase64Encoded': True
+                  "body": json.dumps(body_content_b64),
+                  "isBase64Encoded": True,
               }
       Runtime: python3.8
 
